@@ -30,7 +30,7 @@ Place the script wherever you like and make it executable by using:
 To get a little help on the various available options/arguments available, from inside the directory in which the script resides run:  
 <code>$ ./amdgpu-fancontrol --help</code>
 
-Run the script by doing:
+Run the script by doing:  
 <code>$ sudo ./amdgpu-fancontrol</code>  
 *(To manipulate the files listed in the list above elevated privileges are necessary).*
 
