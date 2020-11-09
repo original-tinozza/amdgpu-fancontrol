@@ -1,0 +1,30 @@
+### Fan curve template file for amdgpu-fancontrol ###
+
+# Lines starting with a 'dash' (#) or completely empty are ignored
+
+# C_MAXPWM defines the maximum PWM value allowed when controlling the  
+# cooling fans.  
+# Only modifications to the numeric values are allowed!  
+C_MAXPWM=145
+
+# C_MAXPOINTS defines the total number of points needed to create  
+# the controlling curve.  
+# Only modifications to the numeric values are allowed!  
+# (at the moment only curves with C_MAXPOINTS=5 are supported,  
+# changing the value will trigger an error.)  
+C_MAXPOINTS=5
+
+# Curve points definition in the format XX:YY:ZZ where:  
+# XX is the point number from 1 to C_MAXPOINTS (0 is ignored)  
+# YY is the TEMPERATURE value at the XX point  
+# ZZ is the PWM set-point value at the XX point  
+# Strictly respect the format (whitespace and tab are not allowed)  
+# Only modifications to the numeric values YY and ZZ are allowed!  
+1:60:65  
+2:70:75  
+3:80:95  
+4:85:115  
+5:90:145  
+
+# the last ZZ value (145 in this case) must be equal to C_MAXPWM defined above
+

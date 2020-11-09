@@ -1,0 +1,651 @@
+#!/bin/bash
+# amdgpu fan control
+# REV 0.1: Original release
+# REV 0.2: Fan curve control added
+# REV 0.3: Fan curve control over averaged temperature, added INFO summary
+# REV 0.4: GPU and MEM emergency temperature separated, added PWM percentage
+# REV 0.5: Removed the whole kernel IDs section
+# REV 0.6: Minor fixes and additions
+# REV   0: Github release
+
+##### START OF FUNCTIONS DEFINITION #####
+
+usage()
+{
+	echo "Usage: ${0##*/} [OPTION]"
+	echo ""
+	echo "Available option:"
+	echo "  --cardnum=###               (video card ID, default 0)"
+	echo "  --fancurve[=/path/to/file]  (default $CONFIGFILE)"
+	echo "  -w or --watchdog            (enable critical temperature monitor)"
+	echo "  --no-spinner                (disable the visual spinner)"
+	echo "  -y or --yes                 (answer yes where applicable)"
+	echo "  -v or --verbose"
+	echo "  -h or --help                (this help)"
+	echo ""
+	echo "Option '--fancurve' is also a shortcut to '--yes' and '--no-spinner'"
+}
+
+menu()
+{
+	echo "***************** AMDGPU Fan control *****************"
+	echo ""
+	echo " =--> u: Unlock PWN manual control"
+	echo " =--> l: Lock PWN manual control (reset to default)"
+	echo " =--> +: Increase PWM set-point by $PWMINCREMENT"
+	echo " =--> -: Decrease PWM set-point by $PWMINCREMENT"
+	echo " =--> e: Edit PWM set-point"
+	echo " =--> s: Show actual Fan configuration"
+	echo " =--> c: Custom fan curve control"
+	echo " =--> h: Print this help menu"
+	echo " =--> i: INFO Summary"
+	echo " =--> q: Quit"
+	echo ""
+	echo "******************************************************"
+}
+
+infosummary()
+{
+	[ -f $EDGE ] && edgetemp=$(( $(cat $EDGE) / 1000 )) || edgetemp="N/A"
+	[ -f $JUNCTION ] && junctiontemp=$(( $(cat $JUNCTION) / 1000 )) || junctiontemp="N/A"
+	[ -f $MEM ] && memtemp=$(( $(cat $MEM) / 1000 )) || memtemp="N/A"
+	[ $(cat $PWMENABLE) -eq 1 ] && manualstatus="UNLOCKED" || manualstatus="Locked"
+	curvefileok=$( [ -f $CONFIGFILE ] && echo "OK" || echo "NOT FOUND!" )
+	PWMperc=$(( $(cat $PWM) * 100 / $PWMMAX ))
+
+	echo ""
+	echo "--------------------    INFO Summary    --------------------"
+#	echo "AMD graphic card: ${carddesc:8}"
+	echo "Graphic card:"
+	echo "    ${carddesc#*: }"
+	echo "------------------------------------------------------------"
+	echo "Graphic card sensors readings:"
+	echo "    Edge=$edgetemp°C; Junction=$junctiontemp°C; Mem=$memtemp°C"
+	echo "    Fan PWM=$(cat $PWM) ($PWMperc%); Fan speed=$(cat $FANRPM)rpm"
+	echo "------------------------------------------------------------"
+	echo "GPU Fan manual control: $manualstatus"
+	echo "------------------------------------------------------------"
+	echo "Script flags and variables status:"
+	echo    "    CARDNUM......$CARDNUM"
+	echo -n "    VERBOSE......"; [ $VERBOSITY -eq 1 ] && echo "ACTIVE" || echo "Disabled"
+	echo -n "    AUTOYES......"; [ $AUTOYES -eq 1 ] && echo "ACTIVE" || echo "Disabled"
+	echo -n "    WATCHDOG....."; [ $WATCHDOG -eq 1 ] && echo "ACTIVE" || echo "Disabled"
+	echo    "           |...CRITICALGPUTEMP= $CRITICALGPUTEMP°C"
+	echo    "           |...CRITICALMEMTEMP= $CRITICALMEMTEMP°C"
+	echo    "           |...EMERGENCYPWM: $EMERGENCYPWM"
+	echo -n "    AUTOCURVE...."; [ $AUTOCURVE -eq 1 ] && echo "ACTIVE" || echo "Disabled"
+	echo -n "    NOSPINNER...."; [ $NOSPINNER -eq 1 ] && echo "ACTIVE" || echo "Disabled"
+	echo    "    CURVECYCLE...$CURVECYCLE s"
+	echo "------------------------------------------------------------"
+	echo "Fan curve definition file:"
+	echo "    CONFIGFILE.......$CONFIGFILE ($curvefileok)"
+	echo "------------------------------------------------------------"
+	if [ ! -z $edgetempmax ] || [ ! -z $junctiontempmax ] || [ ! -z $memtempmax ]; then
+		echo "Maximum registered temperatures during the latest run with"
+		echo "a cooling fans control curve:"
+		echo "    eT_max=$edgetempmax°C ;" \
+			"jT_max=$junctiontempmax°C ;" \
+			"mT_max=$memtempmax°C"
+		echo "------------------------------------------------------------"
+	fi
+	echo ""
+}
+
+argcheck()
+{
+	if [ ! -z $# ]; then
+		for index in $(seq 1 $#)
+		do
+			currentargoption=${1%=*}
+			currentargvalue=${1##*=}
+			case $currentargoption in
+				"--cardnum")
+					if [ ! -z $currentargvalue ] && [ ! $currentargvalue == "$currentargoption" ]; then
+						CARDNUM=$currentargvalue
+					fi
+					;;
+				"--fancurve")
+					if [ ! -z $currentargvalue ] && [ ! $currentargvalue == "$currentargoption" ]; then
+						if [ -f $currentargvalue ]; then
+							CONFIGFILE=$currentargvalue
+						else
+							echo "Curve definition file $currentargvalue doen not exist! [ERROR:4]"
+							sleep 2
+							exit 4
+						fi
+					fi
+					AUTOYES=1
+					NOSPINNER=1
+					AUTOCURVE=1
+					;;
+				"--verbose"|"-v")
+					VERBOSITY=1
+					;;
+				"--yes"|"-y")
+					AUTOYES=1
+					;;
+				"--no-spinner")
+					NOSPINNER=1
+					;;
+#				"--polling")
+#					if [ ! -z $currentargvalue ] && [ ! $currentargvalue == "$currentargoption" ]; then
+#						CURVECYCLE=$currentargvalue
+#					fi
+#					;;
+				"--watchdog"|"-w")
+					WATCHDOG=1
+					;;
+				"--help"|"-h")
+					usage
+					exit 2
+					;;
+				*)
+					echo "Syntax error [ERROR:4]"
+					sleep 2
+					exit 4
+					;;
+			esac
+			shift
+		done
+	fi		
+}
+
+pwmset()
+{
+	lockstatus=$(cat $PWMENABLE)
+	pwmsetpoint=$1
+	pwmsetmessage="$2"
+	if [ $lockstatus -eq 1 ]; then
+		echo $pwmsetpoint > $PWM
+		echo $message
+	else
+		echo "[!] PWM control is LOCKED!"
+	fi
+}
+
+paraminsert()
+{
+	paramlabel=$1
+	parammax=$2
+	parammin=$3
+
+	paramvalue=0
+	while [ $paramvalue -lt 1 ] || [ $paramvalue -gt $PWMMAX ]
+	do
+
+		read -p "[?]    Insert $paramlabel value [$parammax-$parammin,q=exit] --> " paramvalue
+		if [ $paramvalue = "q" ] || [ $paramvalue = "x" ]; then
+			break
+		fi
+	done
+}
+
+curvedefine()
+{
+	if [ -f $CONFIGFILE ]; then
+		[ ! $AUTOYES -eq 1 ] && read -p "[?] Use the curve definition file? [y,n] --> " fileuse || fileuse="y"
+	else
+		fileuse="n"
+	fi
+
+	if [ $fileuse == "y" -o $fileuse == "Y" ]; then
+		curvedefinebyfile
+	else
+		paraminsert "C_MAXPWM" $PWMMIN $PWMMAX
+
+		if [ ! $paramvalue == "q" ]; then
+			C_MAXPWM=$paramvalue
+
+			###TODO: dynamic points number
+			C_MAXPOINTS=5					#fixed number of points defining the curve
+
+			echo "[!] $C_MAXPOINTS points curve definition started:"
+
+			###TODO: check C_TEMP[i+1] > C_TEMP[i]
+			C_TEMP[0]=0
+			echo "[!] TEMPERATURE values from point 1 to $C_MAXPOINTS"
+			for index in $(seq 1 $C_MAXPOINTS)
+			do
+				read -p "[?]    Insert TEMPERATURE value at point $index --> " C_TEMP[$index]
+			done
+
+			C_PWM[0]=$DEFAULPWM				#forcing the lowest PWN value
+			C_PWM[1]=$DEFAULPWM				#forcing the lowest PWN value at the first point
+			C_PWM[$C_MAXPOINTS]=$C_MAXPWM	#forcing the highest PWM value at the last point
+			echo "[i] PWM values from point 2 to $(( C_MAXPOINTS - 1 )) (PWM @ 1: ${C_PWM[1]}; " \
+				"PWM @ $C_MAXPOINTS: ${C_PWM[$C_MAXPOINTS]})"
+			for index in $(seq 2 $(( C_MAXPOINTS - 1 )))
+			do
+				read -p "[?]    Insert PWM value at point $index --> " C_PWM[$index]
+			done
+			
+			### print the curve table
+			for index in $(seq 0 $C_MAXPOINTS)
+			do
+				echo "[i] Curve point $index: T=${C_TEMP[$index]}°C, PWM=${C_PWM[$index]}"
+			done
+		fi
+	fi
+}
+
+curvedefinebyfile()
+{
+	C_TEMP[0]=0
+	C_PWM[0]=$DEFAULPWM
+	linerefnum=1
+	while read -r line
+	do
+		case ${line} in
+			"#"*)
+				#comment lines are ignored
+				;;
+			"")
+				#empty lines are ignored
+				;;
+			"C_MAXPWM="*)
+				C_MAXPWM=${line##*=}
+				;;
+			"C_MAXPOINTS=5")
+				#C_MAXPOINTS=${line##*=}		#TODO arbitrary points number
+				C_MAXPOINTS=5
+				;;
+			0":"*)
+				#lines for point 0 definition are ignored
+				;;
+			[1-9]":"*)
+				IFS=':' read -r point temp pwm <<< $line
+				C_TEMP[$point]=$temp
+				C_PWM[$point]=$pwm
+				;;
+			*)
+				echo "[!] Unexpected value at line $linerefnum. [ERROR:2]"
+				sleep 2
+				exit 2
+				;;
+		esac
+		let "linerefnum++"
+	done < "$CONFIGFILE"
+
+	### print the curve table
+	for index in $(seq 0 $C_MAXPOINTS)
+	do
+		echo "[i] Curve point $index: T=${C_TEMP[$index]}°C, PWM=${C_PWM[$index]}"
+	done
+}
+
+tableassemble()
+{
+	### cycle through the total number of defined ranges
+	### including the range before the first defined point
+	for i in $(seq 0 $((C_MAXPOINTS - 1)))
+	do
+		startt=${C_TEMP[$i]}			#starting TEMPERATURE of actual range
+		startpwm=${C_PWM[$i]}			#starting PWM of actual range
+		endt=${C_TEMP[$((i+1))]}		#ending TEMPERATURE of actual range
+		endpwm=${C_PWM[$((i+1))]}		#ending PWM of actual range
+		
+		let "intervals=$endt-$startt"
+		let "increment=($endpwm-$startpwm)/$intervals"
+
+		if [ $VERBOSITY -eq 1 ]; then
+			echo "[i] -> Range $i: StarTemp=$startt°C, EndTemp=$endt°C"
+			echo "[i]    Range $i: StarPWM=$startpwm EndPWM=$endpwm"
+			echo "[i]    Range $i: TempIntervals=$intervals, PWMIncrement=$increment"
+		fi
+
+		### cycle through all the TEMPERATURE values of the range to build
+		### the vector with the corresponding linearly interpolated PWM value
+		### vector name: Cpwmvec
+		### vector index: temperature value
+		### vector value: pwm value
+		for j in $(seq $startt $endt)
+		do
+			Cpwmvec[$j]=$startpwm
+			let "startpwm=startpwm+$increment"
+		done
+	done
+
+	### print the vector for checking
+	if [ $VERBOSITY -eq 1 ]; then
+		echo "[i]    --------------------------"
+		echo -e "[i]    |  Temp\t|    PWM (%)\t|"
+		echo "[i]    --------------------------"
+		for index in $(seq 0 $endt)
+		do
+			echo -e "[i]    |   $index\t|   ${Cpwmvec[$index]}"\
+				"($(( ${Cpwmvec[$index]} * 100 / PWMMAX ))%)\t|"
+		done
+		echo "[i]    --------------------------"
+	fi
+}
+
+emergencypwmset()
+{
+	targetpwm=$EMERGENCYPWM
+	echo $EMERGENCYPWM > $PWM
+	echo "[!] >>> Fan emergency speed activated for  $(( emergencycycletime + CURVECYCLE )) s <<<"
+	while [ $emergecycounter -ge 0 ]; do
+#		echo -ne "[!] Fan emergency speed active for $emergecycounter seconds\r"
+		let emergecycounter--
+		sleep 1
+	done
+#	echo -e "\n[!]"
+}
+
+curverun()
+{
+	spinner="/-\|"						#spinner string
+#	spinner="0123456789"				#spinner string
+	spinnerindex=0						#spinner cycling index
+	cyclecounter=0						#cycle timer
+	emergencycycletime=20				#time length of the emergency fan speed cycle
+
+	let "spinnermaxpos=${#spinner}-1"
+
+	avgvecindex=0
+	cycleusedreftemp=0
+	edgetempmax=0
+	junctiontempmax=0
+	memtempmax=0
+	### array dimension should be equal to CURVECYCLE (default 10)
+	declare -a edgetempvec=( $(for i in {1..10}; do echo 0; done) )
+	declare -a junctiontempvec=( $(for i in {1..10}; do echo 0; done) )
+	declare -a memtempvec=( $(for i in {1..10}; do echo 0; done) )
+
+	[ ! $AUTOYES -eq 1 ] && read -p "[?] Activate? [y,n] --> " C_start || C_start="y"
+	if [ $C_start == "y" -o $C_start == "Y" ]; then
+		echo "[!] Automatic fan control started"
+		echo "[!] Press CTLR+C to interrupt"
+		while true
+		do
+			trap 'echo "[!] Fan control interrupted!"; break' SIGINT SIGTERM
+			let "reminder=cyclecounter%CURVECYCLE"
+
+			### temperature is assumed 0 for every missing sensor
+			### and its relative file in /sys
+			[ -f $EDGE ] && edgetemp=$(( $(cat $EDGE) / 1000 )) || edgetemp=0
+			[ -f $JUNCTION ] && junctiontemp=$(( $(cat $JUNCTION) / 1000 )) || junctiontemp=0
+			[ -f $MEM ] && memtemp=$(( $(cat $MEM) / 1000 )) || memtemp=0
+
+			### keeps the maximum value of every temperature reading
+			[ $edgetemp -gt $edgetempmax ] && edgetempmax=$edgetemp
+			[ $junctiontemp -gt $junctiontempmax ] && junctiontempmax=$junctiontemp
+			[ $memtemp -gt $memtempmax ] && memtempmax=$memtemp
+
+			### calculate the average of the last CURVECYCLE readings
+			### of every temperature
+			edgetempvec[$avgvecindex]=$edgetemp
+			junctiontempvec[$avgvecindex]=$junctiontemp
+			memtempvec[$avgvecindex]=$memtemp
+			sumedgetemp=${edgetempvec[0]}
+			sumjunctiontemp=${junctiontempvec[0]}
+			summemtemp=${memtempvec[0]}
+			for index in $(seq 1 $(( $CURVECYCLE - 1 ))); do
+				let sumedgetemp+=${edgetempvec[$index]}
+				let sumjunctiontemp+=${junctiontempvec[$index]}
+				let summemtemp+=${memtempvec[$index]}
+			done
+			let edgetempavg=sumedgetemp/CURVECYCLE
+			let junctiontempavg=sumjunctiontemp/CURVECYCLE
+			let memtempavg=summemtemp/CURVECYCLE
+
+#			echo "edgetempvec=${edgetempvec[@]} --> sum=$sumedgetemp --> avg=$edgetempavg"
+#			echo "junctiontempvec=${junctiontempvec[@]} --> sum=$sumjunctiontemp --> avg=$junctiontempavg"
+#			echo "memtempvec=${memtempvec[@]} --> sum=$summemtemp --> avg=$memtempavg"
+#			echo " --->>> VECINDEX=$avgvecindex"
+			let avgvecindex++
+
+			### PWM values are applied every CURVECYCLE seconds
+			if [ $reminder -eq 0 ]; then
+				tempreadingvec=($edgetempavg $junctiontempavg $memtempavg)
+				avgvecindex=0
+
+				### at every cycle the highest TEMPERATURE between
+				### the ones available is used
+				### TODO: explicit selection of which TEMPERATURE to monitor
+				curreftemp=${tempreadingvec[0]}
+				maxtempindex=0
+				for index in 1 2
+				do
+					if [ $curreftemp -lt ${tempreadingvec[$index]} ]; then
+						curreftemp=${tempreadingvec[$index]}
+						maxtempindex=$index
+					fi
+				done
+
+				emergecycounter=$emergencycycletime
+#				echo "--> curreftemp= $curreftemp"
+#				echo "--> cycleusedreftemp= $cycleusedreftemp"
+				if [ ${tempreadingvec[2]} -ge $CRITICALMEMTEMP ] && [ $WATCHDOG -eq 1 ]; then
+					echo "[!] >>>    Critical MEM temperature detected    <<<"
+					emergencypwmset
+				elif [ ${tempreadingvec[0]} -ge $CRITICALGPUTEMP ] || [ ${tempreadingvec[1]} \
+					-ge $CRITICALGPUTEMP ] && [ $WATCHDOG -eq 1 ]; then
+					echo "[!] >>>    Critical GPU temperature detected    <<<"
+					emergencypwmset
+				elif [ $curreftemp -gt ${C_TEMP[$C_MAXPOINTS]} ]; then
+					targetpwm=${Cpwmvec[${C_TEMP[$C_MAXPOINTS]}]}
+				elif [ $(( curreftemp + (TEMPHYSTERESIS / 1000) )) -lt $cycleusedreftemp ]; then
+					### if the maximum average temperature is decreasing the
+					### PWM set-point is changed only if the temperature difference
+					### between to consecutive cycles is more than TEMPHYSTERESIS
+					targetpwm=${Cpwmvec[$curreftemp]}
+					cycleusedreftemp=$curreftemp
+					cyclestatus="[-]"
+				elif [ $curreftemp -gt $cycleusedreftemp ]; then
+					targetpwm=${Cpwmvec[$curreftemp]}
+					cycleusedreftemp=$curreftemp
+					cyclestatus="[+]"
+				else
+					cyclestatus="[=]"
+				fi
+
+				echo $targetpwm > $PWM
+				let targetpwmperc=targetpwm*100/PWMMAX
+
+				if [ $VERBOSITY -eq 1 ]; then
+					echo "[i]    eT=$edgetemp°C ; jT=$junctiontemp°C ; mT=$memtemp°C"
+					### adding the right amount of spaces to mark the temperature
+					### respondible for the PWM change
+					if [ $maxtempindex -eq 2 ]; then
+						echo -ne "$cyclestatus                         "
+					elif [ $maxtempindex -eq 1 ]; then
+						echo -ne "$cyclestatus               "
+					else
+						echo -ne "$cyclestatus     "
+					fi
+					echo "|...PWM=$targetpwm ($targetpwmperc%); " \
+							"RPM=$(cat $FANRPM)rpm"
+				fi
+			fi
+
+			### More or less useless but gives a visual indication that
+			### the script is working in background and not stalled
+			if [ ! $VERBOSITY -eq 1 ] && [ ! $NOSPINNER -eq 1 ]; then
+				echo -ne "\b\b\b[${spinner:$spinnerindex:1}]"
+				let "spinnerindex++"
+				[ $spinnerindex -gt $spinnermaxpos ] && spinnerindex=0
+			fi
+			let "cyclecounter++"
+			sleep 1
+		done
+		trap - SIGINT SIGTERM
+	fi
+
+	echo "[i]    eT_max=$edgetempmax°C ; jT_max=$junctiontempmax°C \
+			; mT_max=$memtempmax°C"
+
+	### Fan control is given back to system
+	### 0=max fan speed, 1=manual fan control, 2=auto fan control
+	echo $DEFAULPWM > $PWM
+	echo "2" > $PWMENABLE
+}
+
+curveactivationsequence()
+{
+	[ ! $(cat $PWMENABLE) -eq 1 ] && echo "1" > $PWMENABLE		#unlock manual fan pwm control if necessary
+	curvedefine
+	tableassemble
+	[ -z $C_MAXPWM ] || curverun
+}
+
+##### END OF FUNCTIONS DEFINITION #####
+
+TEMPHYSTERESIS=5000						#temperature hysteresis in milli °C
+EMERGENCYPWM=200						#pwm fan setting when reaching the CRITICAL???TEMP
+CRITICALGPUTEMP=95						#junction temperature in °C at which the watchdog fires in
+CRITICALMEMTEMP=88						#memory temperature in °C at which the watchdog fires in
+AUTOCURVE=0								#automatic fan curve flag
+WATCHDOG=0								#watchdog mode activation flag
+NOSPINNER=0								#spinner display flag
+CURVECYCLE=10							#default fan curve cycle timer in seconds
+AUTOYES=0								#automatically answer yes to any question flag
+VERBOSITY=0								#amount of information displayed flag
+CONFIGDIR="/etc/default"				#default directory for fan curve definition file
+CONFIGFILE="$CONFIGDIR/amdgpu-fancurve"	#default filename for fan curve definition file
+CARDNUM=0								#graphic card progressive number as per sysfs definition
+
+argcheck "$@"							#check arguments syntax correctness
+
+if [ "$EUID" -ne 0 ]; then
+  echo "[!] Please run as root [ERROR:1]"
+  sleep 2
+  exit 1
+fi
+
+### TODO: those checks need some work
+###  - ls -d /sys/bus/pci/drivers/amdgpu/0000:*/drm
+###  - content of file /sys/class/drm/card?/device/hwmon/hwmon?/name
+### Start by checking if the amdgpu driver is listed among all PCI devices
+if [ ! -z "$(cat /proc/bus/pci/devices | grep amdgpu)" ]; then
+	### in case of multiple amdgpu supported cards the first one
+	### in the directory structure is automatically selected
+	amdgpucardrefid=$(ls -1 -d /sys/bus/pci/drivers/amdgpu/0000* | head -n 1)
+	if [ -z $CARDNUM ]; then
+		selectedcard=$(ls -d $amdgpucardrefid/drm/card* | head -n 1)
+		CARDNUM=${selectedcard: -1}
+	else
+		if [ ! -d $amdgpucardrefid/drm/card$CARDNUM ]; then
+			echo "[!] Selected graphic card not found [ERROR:2]"
+			sleep 2
+			exit 2
+		fi
+	fi
+	### TODO: Is there a less messy way to extract the PCI BUS Address of the card?
+	cardpciaddr=$(ls -l /sys/class/drm/card$CARDNUM)
+	cardpciaddr=${cardpciaddr##*/0000:}
+	cardpciaddr=${cardpciaddr%%/*}
+	carddesc=$(lspci | grep $cardpciaddr)
+	[ $VERBOSITY -eq 1 ] && echo "[i] Graphic card selected: card$CARDNUM"
+	[ $VERBOSITY -eq 1 ] && echo "[i] $carddesc"
+else
+	echo "[!] No compatible graphic card found [ERROR:2]"
+	sleep 2
+	exit 2
+fi
+
+HWMONID=$(ls -1 /sys/class/drm/card$CARDNUM/device/hwmon)
+EDGE="/sys/class/drm/card$CARDNUM/device/hwmon/${HWMONID}/temp1_input"
+JUNCTION="/sys/class/drm/card$CARDNUM/device/hwmon/${HWMONID}/temp2_input"
+MEM="/sys/class/drm/card$CARDNUM/device/hwmon/${HWMONID}/temp3_input"
+FANRPM="/sys/class/drm/card$CARDNUM/device/hwmon/${HWMONID}/fan1_input"
+PWMENABLE="/sys/class/drm/card$CARDNUM/device/hwmon/${HWMONID}/pwm1_enable"
+PWM="/sys/class/drm/card$CARDNUM/device/hwmon/${HWMONID}/pwm1"
+PWMMAX=$(cat /sys/class/drm/card$CARDNUM/device/hwmon/${HWMONID}/pwm1_max)
+PWMMIN=$(cat /sys/class/drm/card$CARDNUM/device/hwmon/${HWMONID}/pwm1_min)
+
+PWMINCREMENT=10
+#DEFAULPWM=50
+DEFAULPWM=$(cat $PWM)
+
+### check the activation of the ppfeaturemask (is it necessary?)
+### TODO: probably the most reliable way is to checked the content of the file
+### /sys/class/drm/card?/device/driver/module/parameters/ppfeaturemask
+### for its base10 value (0xffffffff=4294967295; fffd7fff=4294803455)
+if [ -z "$(cat /proc/cmdline | grep "amdgpu.ppfeaturemask=0xffffffff")" ] && \
+	[ -z "$(cat /proc/cmdline | grep "amdgpu.ppfeaturemask=0xfffd7fff")" ]; then
+	echo "[!] amdgpu ppfeaturemask not set. [ERROR:3]"
+	sleep 2
+	exit 3
+fi
+
+#sudo bash -c 'HWMONID=$(ls -1 /sys/class/drm/card$CARDNUM/device/hwmon) echo "1" > $PWM'
+
+actualpwm=$DEFAULPWM
+
+[ ! $AUTOCURVE -eq 1 ] && menu || { curveactivationsequence; exit 3; }
+
+while true
+do
+	oldpwm=$actualpwm
+	read -p "[?] Select an option [u,l,+,-,e,c,s,h,i,q] --> " sel_option
+    case $sel_option in
+		u)
+				actualpwm=$(cat $PWM)
+				if [ ! $(cat $PWMENABLE) -eq 1 ]; then
+					echo "1" > $PWMENABLE
+					echo $actualpwm > $PWM
+					echo "[*] Fan manual control UNLOCKED!"
+				else
+					echo "[!] Fan manual control already UNLOCKED!"
+				fi
+				;;
+		l)
+				actualpwm=$DEFAULPWM
+				echo "2" > $PWMENABLE
+				echo "[*] Fan manual control LOCKED!"
+				;;
+		+)
+				actualpwm=$(( actualpwm + PWMINCREMENT ))
+				if [ $actualpwm -ge $PWMMAX ]; then
+					actualpwm=$PWMMAX
+					message="[!] Maximum PWM value reached."
+				else
+					message="[+] Fan PWM increased by $PWMINCREMENT units [ $oldpwm >> $actualpwm ]"
+				fi
+				pwmset $actualpwm $message
+				;;
+		-)
+				actualpwm=$(( actualpwm - PWMINCREMENT ))
+				if [ $actualpwm -le $PWMMIN ]; then
+					actualpwm=$PWMMIN
+					message="[!] Minimum PWM value reached."
+				else
+					message="[-] Fan PWM decreased by $PWMINCREMENT units [ $oldpwm >> $actualpwm ]"
+				fi
+				pwmset $actualpwm $message
+				;;
+		e)
+				paraminsert "PWM" $PWMMIN $PWMMAX
+				if [ ! "$paramvalue" == "q" ]; then
+					actualpwm=$paramvalue
+					message="[*] New fan PWM setpoint [ $oldpwm >> $actualpwm ]"
+					pwmset $actualpwm $message
+				fi
+				;;
+		x|q)
+				break
+				;;
+		s)
+				actualpwmperc=$(( $actualpwm *100 / $PWMMAX ))
+				PWMperc=$(( $(cat $PWM) * 100 / $PWMMAX ))
+				echo "[i]    Fan PWN setpoint...$actualpwm ($actualpwmperc%)"
+				echo "[i]    Fan actual PWM.....$(cat $PWM) ($PWMperc%)"
+				echo "[i]    Fan speed RPM......$(cat $FANRPM)"
+				;;
+		c)
+				curveactivationsequence
+				;;
+		h)
+				menu
+				;;
+		i)
+				infosummary
+				;;
+		*)
+				echo "[!] Wrong selection. Please retry."
+				;;
+    esac
+done
+
+exit 0
