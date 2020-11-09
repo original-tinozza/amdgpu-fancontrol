@@ -44,6 +44,20 @@ menu()
 	echo "******************************************************"
 }
 
+ppfeaturemask_check()
+{
+	### check the activation of the ppfeaturemask (is it necessary?)
+	### TODO: probably the most reliable way is to checked the content of the file
+	### /sys/class/drm/card?/device/driver/module/parameters/ppfeaturemask
+	### for its base10 value (0xffffffff=4294967295; fffd7fff=4294803455)
+	if [ -z "$(cat /proc/cmdline | grep "amdgpu.ppfeaturemask=0xffffffff")" ] && \
+		[ -z "$(cat /proc/cmdline | grep "amdgpu.ppfeaturemask=0xfffd7fff")" ]; then
+		echo "[!] amdgpu ppfeaturemask not set. [ERROR:3]"
+		sleep 2
+		exit 3
+	fi
+}
+
 infosummary()
 {
 	[ -f $EDGE ] && edgetemp=$(( $(cat $EDGE) / 1000 )) || edgetemp="N/A"
@@ -472,8 +486,8 @@ curverun()
 		trap - SIGINT SIGTERM
 	fi
 
-	echo "[i]    eT_max=$edgetempmax°C ; jT_max=$junctiontempmax°C \
-			; mT_max=$memtempmax°C"
+	echo "[i]    eT_max=$edgetempmax°C ; jT_max=$junctiontempmax°C; " \
+			"mT_max=$memtempmax°C"
 
 	### Fan control is given back to system
 	### 0=max fan speed, 1=manual fan control, 2=auto fan control
@@ -557,17 +571,6 @@ PWMMIN=$(cat /sys/class/drm/card$CARDNUM/device/hwmon/${HWMONID}/pwm1_min)
 PWMINCREMENT=10
 #DEFAULPWM=50
 DEFAULPWM=$(cat $PWM)
-
-### check the activation of the ppfeaturemask (is it necessary?)
-### TODO: probably the most reliable way is to checked the content of the file
-### /sys/class/drm/card?/device/driver/module/parameters/ppfeaturemask
-### for its base10 value (0xffffffff=4294967295; fffd7fff=4294803455)
-if [ -z "$(cat /proc/cmdline | grep "amdgpu.ppfeaturemask=0xffffffff")" ] && \
-	[ -z "$(cat /proc/cmdline | grep "amdgpu.ppfeaturemask=0xfffd7fff")" ]; then
-	echo "[!] amdgpu ppfeaturemask not set. [ERROR:3]"
-	sleep 2
-	exit 3
-fi
 
 #sudo bash -c 'HWMONID=$(ls -1 /sys/class/drm/card$CARDNUM/device/hwmon) echo "1" > $PWM'
 
