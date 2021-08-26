@@ -7,6 +7,7 @@
 # REV 0.5: Removed the whole kernel IDs section
 # REV 0.6: Minor fixes and additions
 # REV   0: Github release
+# REV   1: Monitoring option added
 
 ##### START OF FUNCTIONS DEFINITION #####
 
@@ -36,6 +37,7 @@ menu()
 	echo " =--> -: Decrease PWM set-point by $PWMINCREMENT"
 	echo " =--> e: Edit PWM set-point"
 	echo " =--> s: Show actual Fan configuration"
+	echo " =--> m: Fan and temperatures Monitoring"
 	echo " =--> c: Custom fan curve control"
 	echo " =--> h: Print this help menu"
 	echo " =--> i: INFO Summary"
@@ -495,6 +497,48 @@ curverun()
 	echo "2" > $PWMENABLE
 }
 
+### This function is only a stripped down curverun() function containing only
+### the temperature reporting
+### TODO: Remove all the duplication
+monitor()
+{
+	edgetempmax=0
+	junctiontempmax=0
+	memtempmax=0
+
+	echo "[!] Fan and temperatures monitoring started"
+	echo "[!] Press CTLR+C to interrupt"
+
+	while true
+	do
+		trap 'echo "[!] Fan monitoring interrupted!"; break' SIGINT SIGTERM
+
+		### temperature is assumed 0 for every missing sensor
+		### and its relative file in /sys
+		[ -f $EDGE ] && edgetemp=$(( $(cat $EDGE) / 1000 )) || edgetemp=0
+		[ -f $JUNCTION ] && junctiontemp=$(( $(cat $JUNCTION) / 1000 )) || junctiontemp=0
+		[ -f $MEM ] && memtemp=$(( $(cat $MEM) / 1000 )) || memtemp=0
+
+		### keeps the maximum value of every temperature reading
+		[ $edgetemp -gt $edgetempmax ] && edgetempmax=$edgetemp
+		[ $junctiontemp -gt $junctiontempmax ] && junctiontempmax=$junctiontemp
+		[ $memtemp -gt $memtempmax ] && memtempmax=$memtemp
+
+		FANRPM="/sys/class/drm/card$CARDNUM/device/hwmon/${HWMONID}/fan1_input"
+		PWM="/sys/class/drm/card$CARDNUM/device/hwmon/${HWMONID}/pwm1"
+
+		let targetpwmperc=$(cat $PWM)*100/PWMMAX
+
+		echo "[i]    eT=$edgetemp°C ; jT=$junctiontemp°C ; mT=$memtemp°C"
+		echo "[i]     |.........|.........|...PWM=$(cat $PWM) ($targetpwmperc%); " \
+						"RPM=$(cat $FANRPM)rpm"
+		sleep 2
+	done
+	
+	echo "[i]    eT_max=$edgetempmax°C ; jT_max=$junctiontempmax°C; " \
+		"mT_max=$memtempmax°C"
+}
+
 curveactivationsequence()
 {
 	[ ! $(cat $PWMENABLE) -eq 1 ] && echo "1" > $PWMENABLE		#unlock manual fan pwm control if necessary
@@ -509,15 +553,15 @@ TEMPHYSTERESIS=5000						#temperature hysteresis in milli °C
 EMERGENCYPWM=200						#pwm fan setting when reaching the CRITICAL???TEMP
 CRITICALGPUTEMP=95						#junction temperature in °C at which the watchdog fires in
 CRITICALMEMTEMP=88						#memory temperature in °C at which the watchdog fires in
-AUTOCURVE=0								#automatic fan curve flag
-WATCHDOG=0								#watchdog mode activation flag
-NOSPINNER=0								#spinner display flag
+AUTOCURVE=0							#automatic fan curve flag
+WATCHDOG=0							#watchdog mode activation flag
+NOSPINNER=0							#spinner display flag
 CURVECYCLE=10							#default fan curve cycle timer in seconds
-AUTOYES=0								#automatically answer yes to any question flag
-VERBOSITY=0								#amount of information displayed flag
-CONFIGDIR="/etc/default"				#default directory for fan curve definition file
-CONFIGFILE="$CONFIGDIR/amdgpu-fancurve"	#default filename for fan curve definition file
-CARDNUM=0								#graphic card progressive number as per sysfs definition
+AUTOYES=0							#automatically answer yes to any question flag
+VERBOSITY=0							#amount of information displayed flag
+CONFIGDIR="/etc/default"					#default directory for fan curve definition file
+CONFIGFILE="$CONFIGDIR/amdgpu-fancurve"				#default filename for fan curve definition file
+CARDNUM=0							#graphic card progressive number as per sysfs definition
 
 argcheck "$@"							#check arguments syntax correctness
 
@@ -635,6 +679,9 @@ do
 				echo "[i]    Fan PWN setpoint...$actualpwm ($actualpwmperc%)"
 				echo "[i]    Fan actual PWM.....$(cat $PWM) ($PWMperc%)"
 				echo "[i]    Fan speed RPM......$(cat $FANRPM)"
+				;;
+		m)
+				monitor
 				;;
 		c)
 				curveactivationsequence
